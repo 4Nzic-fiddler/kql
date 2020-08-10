@@ -1,0 +1,62 @@
+// EvilNum Malware Behavior Detection Rule in KQL for Windows Defender ATP
+// Developed by Randy Pargman @rpargman 07/15/2020
+// EvilNum attempts to evade detection by launching from a shortcut (.lnk) file 
+// which copies itself to a temp folder, uses forfiles.exe to locate the new copy,
+// uses find.exe to extract javascript code into a new file, 
+// and then cscript.exe to execute the javascript.
+// Reference: https://app.any.run/tasks/a2c71046-5001-4e71-bd5b-3ed49224ebae/ sample
+// Reference: https://www.welivesecurity.com/2020/07/09/more-evil-deep-look-evilnum-toolset/
+// Strategy: We will search for any instances of forfiles.exe, find.exe and cscript.exe 
+//           all spawned by the same cmd.exe parent process ID on the same host 
+//           within 60 seconds of each other.
+// Response recommendation: If this alert is triggered, focus initial investigation on the 
+// command line arguments. Any use of find.exe to extract some content out of a .lnk file
+// and save it into a script file (javascript, vbs, etc) is highly suspicious. Grab a copy 
+// of the script and the .lnk file it came from. 
+// ISOLATE the affected machine from the network because
+// it can be completely remote controlled by an attacker just with the JavaScript. 
+// Search for all child processes of cscript and all network communication with the C2 server
+// and identify any lateral movement to other machines, which is likely if it has been running
+// for more than a few hours.
+// TO TEST THIS DETECTION:
+//      Create a local user called admin and log in as that user 
+//      (or modify the commands below to match your username)
+//      Create a text file named 4.png.lnk.txt with the following one line of content 
+//      including the comment and save it in C:\users\admin\Downloads:
+//       WScript.Echo("test complete - javascript executed"); //TRU4
+//
+//      Open cmd.exe, cd to the same directory where you saved the 4.png.lnk.txt and run the
+//      following command (copy and paste it):
+//       C:\Windows\System32\cmd.exe /c path=C:\users\admin\Downloads&&move "4.png*lnk.txt " "C:\Users\admin\AppData\Local\Temp\4.png.lnk"&forfiles /P "C:\Users\admin\AppData\Local\Temp" /M "4.pn*.lnk" /S /D 0 /C "C:\Windows\system32\cmd.exe /c move @path C:\Users\admin\AppData\Local\Temp\1.lnk"&type "C:\Users\admin\AppData\Local\Temp\1.lnk"|find "TRU4">"C:\Users\admin\AppData\Local\Temp\0.js"|rd a||cScRiPt "C:\Users\admin\AppData\Local\Temp\0.js
+// Detection rule follows:
+// Step #1: Get the list of ForFiles.exe processes spawned by cmd.exe
+let ForFilesFromCmd = DeviceProcessEvents 
+| where FileName has "forfiles.exe" and InitiatingProcessFileName has "cmd.exe"
+| project ForFilesDeviceId = DeviceId, ReportId, DeviceName, ForFilesTimestamp = Timestamp, ForFilesCommandLine = ProcessCommandLine, InitiatingProcessCommandLine, ForFilesParent = InitiatingProcessId;
+// Step #2: Get the list of Find.exe processes spawned by cmd.exe
+let FindFromCmd = DeviceProcessEvents
+| where FileName has "find.exe" and InitiatingProcessFileName has "cmd.exe"
+| project FindDeviceId = DeviceId, DeviceName, FindTimestamp = Timestamp, FindCommandLine = ProcessCommandLine, InitiatingProcessCommandLine, FindParent = InitiatingProcessId;
+// Step #3: Get the list of cscript.exe processes spawned by cmd.exe
+let CScriptFromCmd = DeviceProcessEvents
+| where FileName has "cscript.exe" and InitiatingProcessFileName has "cmd.exe"
+| project CScriptDeviceId = DeviceId, DeviceName, CScriptTimestamp = Timestamp, CScriptCommandLine = ProcessCommandLine, InitiatingProcessCommandLine, CScriptParent = InitiatingProcessId;
+// Step #4a: Get the ForFiles and Find processes spawned by the same cmd parent process on the same host within the same minute
+let ForFilesAndFind = ForFilesFromCmd | join FindFromCmd 
+    on ($left.ForFilesDeviceId == $right.FindDeviceId and $left.ForFilesParent == $right.FindParent)
+| where abs(datetime_diff("second", ForFilesTimestamp, FindTimestamp)) < 60;
+// Step #4b: Get the CScript processes spawned by the same cmd parent process as both ForFiles and Find on the same host in the same minute
+let ForFilesAndFindAndCScript = ForFilesAndFind | join CScriptFromCmd
+    on ($left.ForFilesDeviceId == $right.CScriptDeviceId and $left.ForFilesParent == $right.CScriptParent)
+| where abs(datetime_diff("second", FindTimestamp, CScriptTimestamp)) < 60;
+// Finally, format and display the result nicely organized for analyst review
+ForFilesAndFindAndCScript
+| project Timestamp = ForFilesTimestamp, 
+          ReportId,
+          DeviceId = ForFilesDeviceId, 
+          DeviceName, 
+          ForFilesCommandLine, 
+          FindTimestamp, FindCommandLine, 
+          CScriptTimestamp, CScriptCommandLine, 
+          InitiatingProcessCommandLine, 
+          ForFilesParent, FindParent, CScriptParent
